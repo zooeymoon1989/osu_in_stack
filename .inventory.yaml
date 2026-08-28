@@ -1,0 +1,23 @@
+# inventory.example.yml
+
+all:
+  vars:
+    ansible_user: root
+    ansible_python_interpreter: /usr/bin/python3
+
+  children:
+    k8s_nodes:
+      hosts:
+        worker01:
+          ansible_host: 203.0.113.10
+          tailscale_ip: 100.x.x.x
+
+        worker02:
+          ansible_host: 203.0.113.11
+          tailscale_ip: 100.x.x.x
+
+    cloud_nodes:
+      hosts:
+        proxy01:
+          ansible_host: 198.51.100.10
+          tailscale_ip: 100.x.x.x
