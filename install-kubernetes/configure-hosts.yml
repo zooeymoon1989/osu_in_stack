@@ -1,0 +1,52 @@
+---
+# ============================================================
+# Step 1
+# keys_hosts 的 /etc/hosts 被 cloud-init 每次启动重新生成
+# 所以把 K8s 节点写入 cloud-init 的 hosts 模板
+# ============================================================
+
+- name: Configure persistent hosts template on keys hosts
+  hosts: keys_hosts
+  become: true
+
+  vars:
+    k8s_host_list: "{{ groups['k8s_nodes'] }}"
+
+  tasks:
+    - name: Add Kubernetes nodes to cloud-init hosts template
+      ansible.builtin.blockinfile:
+        path: /etc/cloud/templates/hosts.debian.tmpl
+        marker: "# {mark} ANSIBLE MANAGED K8S HOSTS"
+        block: |
+          {% for host in k8s_host_list %}
+          {{ hostvars[host].tailscale_ip }} {{ host }}
+          {% endfor %}
+
+
+# ============================================================
+# Step 2
+# 所有 Kubernetes 节点立即更新 /etc/hosts
+# ============================================================
+
+- name: Configure hosts on all Kubernetes nodes
+  hosts: k8s_nodes
+  become: true
+
+  vars:
+    k8s_host_list: "{{ groups['k8s_nodes'] }}"
+
+  tasks:
+    - name: Add Kubernetes nodes to /etc/hosts
+      ansible.builtin.blockinfile:
+        path: /etc/hosts
+        marker: "# {mark} ANSIBLE MANAGED K8S HOSTS"
+        block: |
+          {% for host in k8s_host_list %}
+          {{ hostvars[host].tailscale_ip }} {{ host }}
+          {% endfor %}
+
+    - name: Verify hostname resolution
+      ansible.builtin.command:
+        cmd: "getent hosts {{ item }}"
+      loop: "{{ k8s_host_list }}"
+      changed_when: false
