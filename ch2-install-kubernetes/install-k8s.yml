@@ -1,0 +1,139 @@
+---
+- name: Install Kubernetes components
+  hosts: k8s_nodes
+  become: true
+
+  vars:
+    kubernetes_minor_version: "v1.37"
+    kubernetes_apt_keyring: "/etc/apt/keyrings/kubernetes-apt-keyring.gpg"
+    kubernetes_repo_file: "/etc/apt/sources.list.d/kubernetes.list"
+
+  tasks:
+    # ============================================================
+    # 1. Install packages required for Kubernetes APT repository
+    # ============================================================
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install Kubernetes repository dependencies
+      ansible.builtin.apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gpg
+        state: present
+
+    # ============================================================
+    # 2. Create APT keyring directory
+    # ============================================================
+    - name: Ensure apt keyrings directory exists
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    # ============================================================
+    # 3. Download Kubernetes repository signing key
+    # ============================================================
+    - name: Download Kubernetes repository signing key
+      ansible.builtin.get_url:
+        url: "https://pkgs.k8s.io/core:/stable:/{{ kubernetes_minor_version }}/deb/Release.key"
+        dest: /tmp/kubernetes-release.key
+        mode: "0644"
+
+    - name: Convert Kubernetes signing key to GPG keyring
+      ansible.builtin.command:
+        cmd: >
+          gpg --dearmor
+          --yes
+          --output {{ kubernetes_apt_keyring }}
+          /tmp/kubernetes-release.key
+      changed_when: true
+
+    - name: Set Kubernetes keyring permissions
+      ansible.builtin.file:
+        path: "{{ kubernetes_apt_keyring }}"
+        owner: root
+        group: root
+        mode: "0644"
+
+    # ============================================================
+    # 4. Configure Kubernetes APT repository
+    # ============================================================
+    - name: Add Kubernetes apt repository
+      ansible.builtin.copy:
+        dest: "{{ kubernetes_repo_file }}"
+        content: |
+          deb [signed-by={{ kubernetes_apt_keyring }}] https://pkgs.k8s.io/core:/stable:/{{ kubernetes_minor_version }}/deb/ /
+        owner: root
+        group: root
+        mode: "0644"
+
+    # ============================================================
+    # 5. Install kubelet / kubeadm / kubectl
+    # ============================================================
+    - name: Update apt cache after adding Kubernetes repository
+      ansible.builtin.apt:
+        update_cache: true
+
+    - name: Install Kubernetes packages
+      ansible.builtin.apt:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: present
+
+    # ============================================================
+    # 6. Hold Kubernetes package versions
+    # ============================================================
+    - name: Hold Kubernetes packages
+      ansible.builtin.dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop:
+        - kubelet
+        - kubeadm
+        - kubectl
+
+    # ============================================================
+    # 7. Enable kubelet
+    # ============================================================
+    - name: Enable kubelet service
+      ansible.builtin.systemd:
+        name: kubelet
+        enabled: true
+
+    # ============================================================
+    # 8. Verification
+    # ============================================================
+    - name: Get kubeadm version
+      ansible.builtin.command:
+        cmd: kubeadm version -o short
+      register: kubeadm_version
+      changed_when: false
+
+    - name: Get kubelet version
+      ansible.builtin.command:
+        cmd: kubelet --version
+      register: kubelet_version
+      changed_when: false
+
+    - name: Get kubectl version
+      ansible.builtin.command:
+        cmd: kubectl version --client
+      register: kubectl_version
+      changed_when: false
+
+    - name: Show Kubernetes versions
+      ansible.builtin.debug:
+        msg:
+          - "Host: {{ inventory_hostname }}"
+          - "kubeadm: {{ kubeadm_version.stdout }}"
+          - "kubelet: {{ kubelet_version.stdout }}"
+          - "kubectl: {{ kubectl_version.stdout_lines[0] }}"

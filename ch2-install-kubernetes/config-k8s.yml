@@ -1,0 +1,110 @@
+---
+- name: Initialize Kubernetes control plane
+  hosts: node1
+  become: true
+
+  vars:
+    control_plane_ip: "{{ hostvars['node1']['tailscale_ip'] }}"
+    kubernetes_version: "v1.37.0"
+    cri_socket: "unix:///run/containerd/containerd.sock"
+
+    # 先给 Cilium 预留一个和现有网络不冲突的 Pod CIDR
+    pod_network_cidr: "10.244.0.0/16"
+
+  tasks:
+    # ============================================================
+    # 1. Generate kubeadm configuration
+    # ============================================================
+
+    - name: Create kubeadm config
+      ansible.builtin.copy:
+        dest: /root/kubeadm-config.yaml
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          apiVersion: kubeadm.k8s.io/v1beta4
+          kind: InitConfiguration
+
+          localAPIEndpoint:
+            advertiseAddress: "{{ control_plane_ip }}"
+            bindPort: 6443
+
+          nodeRegistration:
+            criSocket: "{{ cri_socket }}"
+
+          ---
+          apiVersion: kubeadm.k8s.io/v1beta4
+          kind: ClusterConfiguration
+
+          kubernetesVersion: "{{ kubernetes_version }}"
+
+          controlPlaneEndpoint: "{{ control_plane_ip }}:6443"
+
+          networking:
+            podSubnet: "{{ pod_network_cidr }}"
+
+          apiServer:
+            certSANs:
+              - "{{ control_plane_ip }}"
+              - "node1"
+              - "127.0.0.1"
+              - "localhost"
+
+    # ============================================================
+    # 2. Pull Kubernetes images
+    # ============================================================
+
+    - name: Pull Kubernetes control plane images
+      ansible.builtin.command:
+        cmd: kubeadm config images pull --config /root/kubeadm-config.yaml
+      register: kubeadm_images
+      changed_when: true
+
+    # ============================================================
+    # 3. Initialize control plane
+    # ============================================================
+
+    - name: Initialize Kubernetes control plane
+      ansible.builtin.command:
+        cmd: kubeadm init --config /root/kubeadm-config.yaml
+      args:
+        creates: /etc/kubernetes/admin.conf
+      register: kubeadm_init
+
+    # ============================================================
+    # 4. Configure kubectl for root
+    # ============================================================
+
+    - name: Create root kubeconfig directory
+      ansible.builtin.file:
+        path: /root/.kube
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Copy Kubernetes admin config
+      ansible.builtin.copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /root/.kube/config
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0600"
+
+    # ============================================================
+    # 5. Verify control plane
+    # ============================================================
+
+    - name: Get Kubernetes nodes
+      ansible.builtin.command:
+        cmd: kubectl get nodes -o wide
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: kubernetes_nodes
+      changed_when: false
+
+    - name: Show Kubernetes nodes
+      ansible.builtin.debug:
+        var: kubernetes_nodes.stdout_lines
