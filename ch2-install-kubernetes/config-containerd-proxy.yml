@@ -1,0 +1,52 @@
+---
+- name: Configure Tinyproxy for containerd
+  hosts: k8s_nodes
+  become: true
+
+  vars:
+    tinyproxy_host: "bwh-minichicken-05-22"
+    tinyproxy_port: 3128
+    tinyproxy_user: "osu"
+    tinyproxy_password: "osuinstack"
+
+    tinyproxy_url: >-
+      http://{{ tinyproxy_user }}:{{ tinyproxy_password }}@
+      {{ hostvars[tinyproxy_host]['tailscale_ip'] }}:{{ tinyproxy_port }}
+
+  tasks:
+    - name: Create containerd systemd override directory
+      ansible.builtin.file:
+        path: /etc/systemd/system/containerd.service.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Configure Tinyproxy for containerd
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/containerd.service.d/http-proxy.conf
+        content: |
+          [Service]
+          Environment="HTTP_PROXY={{ tinyproxy_url | replace('\n', '') | replace(' ', '') }}"
+          Environment="HTTPS_PROXY={{ tinyproxy_url | replace('\n', '') | replace(' ', '') }}"
+          Environment="NO_PROXY=127.0.0.1,localhost,10.0.0.0/8,100.64.0.0/10,172.16.0.0/12,192.168.0.0/16"
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Reload systemd and restart containerd
+      ansible.builtin.systemd:
+        name: containerd
+        state: restarted
+        daemon_reload: true
+        enabled: true
+
+    - name: Verify containerd proxy environment
+      ansible.builtin.command:
+        cmd: systemctl show containerd --property=Environment
+      register: containerd_proxy
+      changed_when: false
+
+    - name: Show containerd proxy environment
+      ansible.builtin.debug:
+        var: containerd_proxy.stdout

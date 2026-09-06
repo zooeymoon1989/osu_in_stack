@@ -1,0 +1,168 @@
+---
+- name: Prepare all Kubernetes nodes
+  hosts: k8s_nodes
+  become: true
+
+  tasks:
+    # ============================================================
+    # 1. Disable swap
+    # ============================================================
+    - name: Disable swap immediately
+      ansible.builtin.command:
+        cmd: swapoff -a
+      changed_when: false
+
+    - name: Disable swap permanently in /etc/fstab
+      ansible.builtin.replace:
+        path: /etc/fstab
+        regexp: '^([^#].*\sswap\s+.*)$'
+        replace: '# \1'
+
+    # ============================================================
+    # 2. Kernel modules
+    # ============================================================
+    - name: Persist required kernel modules
+      ansible.builtin.copy:
+        dest: /etc/modules-load.d/k8s.conf
+        content: |
+          overlay
+          br_netfilter
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Load required kernel modules
+      ansible.builtin.command:
+        cmd: "modprobe {{ item }}"
+      loop:
+        - overlay
+        - br_netfilter
+      changed_when: false
+
+    # ============================================================
+    # 3. Sysctl
+    # ============================================================
+    - name: Configure Kubernetes sysctl parameters
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/99-kubernetes-cri.conf
+        content: |
+          net.bridge.bridge-nf-call-iptables  = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.ipv4.ip_forward                 = 1
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Apply sysctl parameters
+      ansible.builtin.command:
+        cmd: sysctl --system
+      changed_when: false
+
+    # ============================================================
+    # 4. Install containerd
+    # ============================================================
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install containerd
+      ansible.builtin.apt:
+        name:
+          - containerd
+        state: present
+
+    - name: Ensure containerd config directory exists
+      ansible.builtin.file:
+        path: /etc/containerd
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Generate default containerd config
+      ansible.builtin.command:
+        cmd: containerd config default
+      register: containerd_default_config
+      changed_when: false
+
+    - name: Write containerd config
+      ansible.builtin.copy:
+        dest: /etc/containerd/config.toml
+        content: "{{ containerd_default_config.stdout }}\n"
+        owner: root
+        group: root
+        mode: "0644"
+
+    # ============================================================
+    # 5. Configure SystemdCgroup
+    # ============================================================
+    - name: Enable SystemdCgroup in containerd
+      ansible.builtin.replace:
+        path: /etc/containerd/config.toml
+        regexp: 'SystemdCgroup = false'
+        replace: 'SystemdCgroup = true'
+
+    - name: Restart and enable containerd
+      ansible.builtin.systemd:
+        name: containerd
+        state: restarted
+        enabled: true
+        daemon_reload: true
+
+    # ============================================================
+    # 6. Verification
+    # ============================================================
+    - name: Check swap status
+      ansible.builtin.command:
+        cmd: swapon --show
+      register: swap_status
+      changed_when: false
+
+    - name: Check overlay module
+      ansible.builtin.shell:
+        cmd: lsmod | grep '^overlay'
+      register: overlay_status
+      changed_when: false
+
+    - name: Check br_netfilter module
+      ansible.builtin.shell:
+        cmd: lsmod | grep '^br_netfilter'
+      register: br_netfilter_status
+      changed_when: false
+
+    - name: Check IPv4 forwarding
+      ansible.builtin.command:
+        cmd: sysctl -n net.ipv4.ip_forward
+      register: ip_forward_status
+      changed_when: false
+
+    - name: Check bridge iptables
+      ansible.builtin.command:
+        cmd: sysctl -n net.bridge.bridge-nf-call-iptables
+      register: bridge_iptables_status
+      changed_when: false
+
+    - name: Check containerd service
+      ansible.builtin.command:
+        cmd: systemctl is-active containerd
+      register: containerd_status
+      changed_when: false
+
+    - name: Check SystemdCgroup setting
+      ansible.builtin.shell:
+        cmd: grep -E 'SystemdCgroup = true' /etc/containerd/config.toml
+      register: systemd_cgroup_status
+      changed_when: false
+
+    - name: Show Kubernetes node preparation result
+      ansible.builtin.debug:
+        msg:
+          - "Host: {{ inventory_hostname }}"
+          - "Swap: {{ 'disabled' if swap_status.stdout == '' else swap_status.stdout }}"
+          - "overlay: loaded"
+          - "br_netfilter: loaded"
+          - "ip_forward: {{ ip_forward_status.stdout }}"
+          - "bridge-nf-call-iptables: {{ bridge_iptables_status.stdout }}"
+          - "containerd: {{ containerd_status.stdout }}"
+          - "SystemdCgroup: enabled"
