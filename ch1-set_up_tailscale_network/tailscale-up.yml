@@ -10,9 +10,17 @@
 
   tasks:
     - name: Join Tailscale network
-      command: tailscale up --authkey={{ tailscale_auth_key }}
+      ansible.builtin.command:
+        cmd: "tailscale up --auth-key={{ tailscale_auth_key }}"
       register: tailscale_up
+      no_log: true
+
+    - name: Show Tailscale status
+      ansible.builtin.command:
+        cmd: tailscale status
+      register: tailscale_status
+      changed_when: false
 
     - name: Show result
-      debug:
-        var: tailscale_up.stdout
+      ansible.builtin.debug:
+        var: tailscale_status.stdout_lines

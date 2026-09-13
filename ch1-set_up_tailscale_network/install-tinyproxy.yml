@@ -1,0 +1,20 @@
+---
+- name: Install TinyProxy
+  hosts: bwh-minichicken-05-22
+  become: true
+
+  tasks:
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install TinyProxy
+      ansible.builtin.apt:
+        name: tinyproxy
+        state: present
+
+    - name: Enable TinyProxy
+      ansible.builtin.systemd:
+        name: tinyproxy
+        enabled: true
