@@ -1,17 +1,28 @@
 ---
-- name: Install Kubernetes components
+- name: Install Kubernetes 1.36.4 components
   hosts: k8s_nodes
   become: true
+  gather_facts: true
 
   vars:
-    kubernetes_minor_version: "v1.37"
+    kubernetes_minor_version: "v1.36"
+    kubernetes_patch_version: "1.36.4"
+
     kubernetes_apt_keyring: "/etc/apt/keyrings/kubernetes-apt-keyring.gpg"
     kubernetes_repo_file: "/etc/apt/sources.list.d/kubernetes.list"
 
+    kubernetes_repo_url: >-
+      https://pkgs.k8s.io/core:/stable:/{{ kubernetes_minor_version }}/deb/
+
+    kubernetes_release_key_url: >-
+      https://pkgs.k8s.io/core:/stable:/{{ kubernetes_minor_version }}/deb/Release.key
+
   tasks:
+
     # ============================================================
-    # 1. Install packages required for Kubernetes APT repository
+    # 1. Install dependencies
     # ============================================================
+
     - name: Update apt cache
       ansible.builtin.apt:
         update_cache: true
@@ -20,15 +31,16 @@
     - name: Install Kubernetes repository dependencies
       ansible.builtin.apt:
         name:
-          - apt-transport-https
           - ca-certificates
           - curl
           - gpg
         state: present
 
+
     # ============================================================
-    # 2. Create APT keyring directory
+    # 2. Prepare APT keyring
     # ============================================================
+
     - name: Ensure apt keyrings directory exists
       ansible.builtin.file:
         path: /etc/apt/keyrings
@@ -37,23 +49,30 @@
         group: root
         mode: "0755"
 
+
     # ============================================================
-    # 3. Download Kubernetes repository signing key
+    # 3. Download Kubernetes signing key
     # ============================================================
+
     - name: Download Kubernetes repository signing key
       ansible.builtin.get_url:
-        url: "https://pkgs.k8s.io/core:/stable:/{{ kubernetes_minor_version }}/deb/Release.key"
+        url: "{{ kubernetes_release_key_url }}"
         dest: /tmp/kubernetes-release.key
+        owner: root
+        group: root
         mode: "0644"
+        force: true
 
     - name: Convert Kubernetes signing key to GPG keyring
       ansible.builtin.command:
-        cmd: >
-          gpg --dearmor
-          --yes
-          --output {{ kubernetes_apt_keyring }}
-          /tmp/kubernetes-release.key
-      changed_when: true
+        argv:
+          - gpg
+          - --dearmor
+          - --yes
+          - --output
+          - "{{ kubernetes_apt_keyring }}"
+          - /tmp/kubernetes-release.key
+      changed_when: false
 
     - name: Set Kubernetes keyring permissions
       ansible.builtin.file:
@@ -62,36 +81,133 @@
         group: root
         mode: "0644"
 
+
     # ============================================================
-    # 4. Configure Kubernetes APT repository
+    # 4. Configure Kubernetes v1.36 repository
     # ============================================================
-    - name: Add Kubernetes apt repository
+
+    - name: Configure Kubernetes apt repository
       ansible.builtin.copy:
         dest: "{{ kubernetes_repo_file }}"
-        content: |
-          deb [signed-by={{ kubernetes_apt_keyring }}] https://pkgs.k8s.io/core:/stable:/{{ kubernetes_minor_version }}/deb/ /
         owner: root
         group: root
         mode: "0644"
+        content: |
+          deb [signed-by={{ kubernetes_apt_keyring }}] {{ kubernetes_repo_url }} /
+
 
     # ============================================================
-    # 5. Install kubelet / kubeadm / kubectl
+    # 5. Refresh APT
+    #
+    # command 比 apt:update_cache 在失败时更容易看到真实错误
     # ============================================================
+
     - name: Update apt cache after adding Kubernetes repository
-      ansible.builtin.apt:
-        update_cache: true
+      ansible.builtin.command:
+        cmd: apt-get update
+      register: apt_update
+      changed_when: false
+
+    - name: Show apt update result
+      ansible.builtin.debug:
+        var: apt_update.stdout_lines
+
+
+    # ============================================================
+    # 6. Check available kubeadm versions
+    # ============================================================
+
+    - name: Check available kubeadm versions
+      ansible.builtin.command:
+        cmd: apt-cache madison kubeadm
+      register: kubeadm_available_versions
+      changed_when: false
+
+    - name: Show available kubeadm versions
+      ansible.builtin.debug:
+        var: kubeadm_available_versions.stdout_lines
+
+
+    # ============================================================
+    # 7. Resolve exact 1.36.4 Debian package version
+    # ============================================================
+
+    - name: Resolve Kubernetes package version
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+
+          apt-cache madison kubeadm |
+          awk -F '|' '
+            {
+              gsub(/^[ \t]+|[ \t]+$/, "", $2)
+              if ($2 ~ /^{{ kubernetes_patch_version | regex_escape }}-/) {
+                print $2
+                exit
+              }
+            }
+          '
+      args:
+        executable: /bin/bash
+      register: kubernetes_package_version_result
+      changed_when: false
+
+    - name: Verify Kubernetes package exists
+      ansible.builtin.assert:
+        that:
+          - kubernetes_package_version_result.stdout | trim | length > 0
+        fail_msg: |
+          Kubernetes {{ kubernetes_patch_version }} was not found.
+
+          Available versions:
+
+          {{ kubeadm_available_versions.stdout }}
+
+    - name: Save Kubernetes package version
+      ansible.builtin.set_fact:
+        kubernetes_package_version: >-
+          {{ kubernetes_package_version_result.stdout | trim }}
+
+    - name: Show selected Kubernetes version
+      ansible.builtin.debug:
+        msg:
+          - "Kubernetes: {{ kubernetes_patch_version }}"
+          - "APT package: {{ kubernetes_package_version }}"
+
+
+    # ============================================================
+    # 8. Unhold packages if re-running
+    # ============================================================
+
+    - name: Unhold Kubernetes packages
+      ansible.builtin.command:
+        cmd: "apt-mark unhold {{ item }}"
+      loop:
+        - kubelet
+        - kubeadm
+        - kubectl
+      changed_when: false
+      failed_when: false
+
+
+    # ============================================================
+    # 9. Install Kubernetes 1.36.4
+    # ============================================================
 
     - name: Install Kubernetes packages
       ansible.builtin.apt:
         name:
-          - kubelet
-          - kubeadm
-          - kubectl
+          - "kubelet={{ kubernetes_package_version }}"
+          - "kubeadm={{ kubernetes_package_version }}"
+          - "kubectl={{ kubernetes_package_version }}"
         state: present
+        allow_downgrade: true
+
 
     # ============================================================
-    # 6. Hold Kubernetes package versions
+    # 10. Hold package versions
     # ============================================================
+
     - name: Hold Kubernetes packages
       ansible.builtin.dpkg_selections:
         name: "{{ item }}"
@@ -101,17 +217,21 @@
         - kubeadm
         - kubectl
 
+
     # ============================================================
-    # 7. Enable kubelet
+    # 11. Enable kubelet
     # ============================================================
-    - name: Enable kubelet service
-      ansible.builtin.systemd:
+
+    - name: Enable kubelet
+      ansible.builtin.systemd_service:
         name: kubelet
         enabled: true
 
+
     # ============================================================
-    # 8. Verification
+    # 12. Verify versions
     # ============================================================
+
     - name: Get kubeadm version
       ansible.builtin.command:
         cmd: kubeadm version -o short
@@ -130,10 +250,53 @@
       register: kubectl_version
       changed_when: false
 
-    - name: Show Kubernetes versions
+
+    # ============================================================
+    # 13. Verify expected version
+    # ============================================================
+
+    - name: Verify Kubernetes versions
+      ansible.builtin.assert:
+        that:
+          - "'v' + kubernetes_patch_version in kubeadm_version.stdout"
+          - "'v' + kubernetes_patch_version in kubelet_version.stdout"
+          - "'v' + kubernetes_patch_version in kubectl_version.stdout"
+        fail_msg: |
+          Kubernetes component version mismatch.
+
+          kubeadm:
+          {{ kubeadm_version.stdout }}
+
+          kubelet:
+          {{ kubelet_version.stdout }}
+
+          kubectl:
+          {{ kubectl_version.stdout }}
+
+
+    # ============================================================
+    # 14. Cleanup
+    # ============================================================
+
+    - name: Remove temporary Kubernetes signing key
+      ansible.builtin.file:
+        path: /tmp/kubernetes-release.key
+        state: absent
+
+
+    # ============================================================
+    # 15. Final output
+    # ============================================================
+
+    - name: Show Kubernetes installation result
       ansible.builtin.debug:
         msg:
+          - "=================================================="
           - "Host: {{ inventory_hostname }}"
+          - "Repository: {{ kubernetes_repo_url }}"
+          - "Package: {{ kubernetes_package_version }}"
           - "kubeadm: {{ kubeadm_version.stdout }}"
           - "kubelet: {{ kubelet_version.stdout }}"
           - "kubectl: {{ kubectl_version.stdout_lines[0] }}"
+          - "Packages held: kubelet kubeadm kubectl"
+          - "=================================================="

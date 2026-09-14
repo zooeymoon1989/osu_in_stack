@@ -1,12 +1,12 @@
 ---
-- name: Upgrade containerd to 2.x on Kubernetes nodes
+- name: Upgrade containerd to 2.3 LTS on Kubernetes nodes
   hosts: k8s_nodes
   become: true
   gather_facts: true
 
   vars:
     # ============================================================
-    # Tinyproxy
+    # TinyProxy
     # ============================================================
 
     tinyproxy_host: "bwh-minichicken-05-22"
@@ -14,11 +14,13 @@
     tinyproxy_user: "osu"
     tinyproxy_password: "osuinstack"
 
+    # 从 inventory 中直接取得 TinyProxy 服务器的 Tailscale IP
     tinyproxy_ip: "{{ hostvars[tinyproxy_host]['tailscale_ip'] }}"
 
     tinyproxy_url: >-
       http://{{ tinyproxy_user }}:{{ tinyproxy_password }}@{{ tinyproxy_ip }}:{{ tinyproxy_port }}
 
+    # containerd 不应该代理这些私网地址
     no_proxy_list: >-
       127.0.0.1,
       localhost,
@@ -30,7 +32,7 @@
     clean_no_proxy: "{{ no_proxy_list | replace('\n', '') | replace(' ', '') }}"
 
     # ============================================================
-    # Docker CE / TUNA
+    # Docker CE repository / TUNA
     # ============================================================
 
     docker_repo_os: "{{ ansible_facts['distribution'] | lower }}"
@@ -48,6 +50,9 @@
 
     docker_tuna_base: "https://mirrors.tuna.tsinghua.edu.cn/docker-ce"
 
+    # 我们这次明确锁 containerd 2.3 LTS
+    containerd_branch: "2.3"
+
   tasks:
 
     # ============================================================
@@ -61,22 +66,30 @@
           - ansible_facts['distribution_release'] | length > 0
         fail_msg: |
           Unsupported OS:
+
+          Distribution:
           {{ ansible_facts['distribution'] }}
+
+          Version:
           {{ ansible_facts['distribution_version'] }}
 
     - name: Show system information
       ansible.builtin.debug:
         msg:
+          - "=============================================="
           - "Host: {{ inventory_hostname }}"
           - "OS: {{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] }}"
           - "Codename: {{ ansible_facts['distribution_release'] }}"
           - "Architecture: {{ ansible_facts['architecture'] }}"
           - "Docker repo OS: {{ docker_repo_os }}"
           - "Docker repo arch: {{ docker_repo_arch }}"
+          - "TinyProxy: {{ tinyproxy_ip }}:{{ tinyproxy_port }}"
+          - "Target containerd: {{ containerd_branch }}.x"
+          - "=============================================="
 
 
     # ============================================================
-    # 1. Verify TUNA connectivity
+    # 1. Verify TinyProxy / TUNA connectivity
     # ============================================================
 
     - name: Verify TUNA Docker CE repository
@@ -107,27 +120,55 @@
           stderr:
           {{ tuna_repo_test.stderr | default('') }}
 
+    - name: Verify TinyProxy can reach Docker download site
+      ansible.builtin.command:
+        argv:
+          - curl
+          - -fsSI
+          - --max-time
+          - "15"
+          - -x
+          - "{{ tinyproxy_url }}"
+          - "https://download.docker.com/"
+      register: proxy_test
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: Fail when TinyProxy is unavailable
+      ansible.builtin.assert:
+        that:
+          - proxy_test.rc == 0
+        fail_msg: |
+          TinyProxy test failed on {{ inventory_hostname }}.
+
+          Verify:
+          - Tailscale connectivity
+          - TinyProxy service
+          - TCP port {{ tinyproxy_port }}
+          - BasicAuth configuration
+
 
     # ============================================================
-    # 2. Install dependencies
+    # 2. Install repository dependencies
     # ============================================================
 
     - name: Update apt cache
-      ansible.builtin.command:
-        cmd: apt-get update
-      register: apt_update_initial
-      changed_when: false
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
 
     - name: Install repository dependencies
       ansible.builtin.apt:
         name:
           - ca-certificates
           - curl
+          - gpg
         state: present
 
 
     # ============================================================
-    # 3. Prepare keyring
+    # 3. Prepare apt keyring
     # ============================================================
 
     - name: Ensure apt keyring directory exists
@@ -140,10 +181,10 @@
 
 
     # ============================================================
-    # 4. Docker signing key
+    # 4. Download Docker signing key
     # ============================================================
 
-    - name: Download Docker signing key through Tinyproxy
+    - name: Download Docker signing key through TinyProxy
       ansible.builtin.get_url:
         url: "https://download.docker.com/linux/{{ docker_repo_os }}/gpg"
         dest: /etc/apt/keyrings/docker.asc
@@ -161,7 +202,7 @@
 
 
     # ============================================================
-    # 5. Configure TUNA Docker CE repo
+    # 5. Configure TUNA Docker CE repository
     # ============================================================
 
     - name: Configure TUNA Docker CE repository
@@ -180,22 +221,35 @@
 
 
     # ============================================================
-    # 6. Refresh apt
+    # 6. Pin containerd.io to 2.3.x
+    #
+    # 防止以后仓库出现 2.4 时，
+    # apt upgrade 自动把我们从 2.3 LTS 带走。
     # ============================================================
 
-    - name: Update apt cache after adding TUNA repository
-      ansible.builtin.command:
-        cmd: apt-get update
-      register: docker_apt_update
-      changed_when: false
-
-    - name: Show apt update result
-      ansible.builtin.debug:
-        var: docker_apt_update.stdout_lines
+    - name: Pin containerd.io to 2.3.x
+      ansible.builtin.copy:
+        dest: /etc/apt/preferences.d/containerd-2.3
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          Package: containerd.io
+          Pin: version 2.3.*
+          Pin-Priority: 1001
 
 
     # ============================================================
-    # 7. Verify containerd.io package
+    # 7. Refresh apt repository
+    # ============================================================
+
+    - name: Update apt cache after adding Docker repository
+      ansible.builtin.apt:
+        update_cache: true
+
+
+    # ============================================================
+    # 8. Verify containerd.io 2.3 package exists
     # ============================================================
 
     - name: Check containerd.io package policy
@@ -208,19 +262,35 @@
       ansible.builtin.debug:
         var: containerd_policy.stdout_lines
 
-    - name: Verify containerd.io candidate exists
+    - name: Check available containerd.io versions
+      ansible.builtin.command:
+        cmd: apt-cache madison containerd.io
+      register: containerd_versions
+      changed_when: false
+
+    - name: Show available containerd.io versions
+      ansible.builtin.debug:
+        var: containerd_versions.stdout_lines
+
+    - name: Verify containerd 2.3 package exists
       ansible.builtin.assert:
         that:
-          - "'Candidate:' in containerd_policy.stdout"
+          - "'2.3.' in containerd_versions.stdout"
           - "'Candidate: (none)' not in containerd_policy.stdout"
         fail_msg: |
-          No usable containerd.io candidate found.
+          No usable containerd 2.3.x package found.
+
+          apt-cache policy:
 
           {{ containerd_policy.stdout }}
 
+          Available versions:
+
+          {{ containerd_versions.stdout }}
+
 
     # ============================================================
-    # 8. Read old version
+    # 9. Read current containerd version
     # ============================================================
 
     - name: Get current containerd version
@@ -242,28 +312,34 @@
 
 
     # ============================================================
-    # 9. Remove distribution containerd package
+    # 10. Remove conflicting distribution packages
+    #
+    # Docker/containerd.io 自己提供 runtime 依赖，
+    # distribution containerd / runc 可能冲突。
     # ============================================================
 
-    - name: Remove distribution containerd package
+    - name: Remove conflicting distribution runtime packages
       ansible.builtin.apt:
-        name: containerd
+        name:
+          - containerd
+          - runc
         state: absent
         purge: false
 
 
     # ============================================================
-    # 10. Install / upgrade containerd.io
+    # 11. Install containerd.io 2.3.x
     # ============================================================
 
-    - name: Install latest containerd.io
+    - name: Install containerd.io 2.3 LTS
       ansible.builtin.apt:
         name: containerd.io
-        state: latest
+        state: present
+        allow_downgrade: true
 
 
     # ============================================================
-    # 11. Verify containerd 2.x
+    # 12. Verify installed containerd version
     # ============================================================
 
     - name: Get installed containerd version
@@ -272,24 +348,32 @@
       register: new_containerd_version
       changed_when: false
 
-    - name: Verify containerd major version is 2
+    - name: Show installed containerd version
+      ansible.builtin.debug:
+        var: new_containerd_version.stdout
+
+    - name: Verify containerd version is 2.3.x
       ansible.builtin.assert:
         that:
-          - "'v2.' in new_containerd_version.stdout"
+          - "new_containerd_version.stdout is regex('.*\\sv?2\\.3\\.[0-9]+.*')"
         fail_msg: |
-          Expected containerd 2.x.
+          Expected containerd 2.3.x.
 
           Actual:
+
           {{ new_containerd_version.stdout }}
 
         success_msg: |
-          containerd 2.x installed successfully.
+          containerd 2.3.x installed successfully.
 
           {{ new_containerd_version.stdout }}
 
 
     # ============================================================
-    # 12. Generate clean containerd 2.x configuration
+    # 13. Generate fresh containerd 2.3 config
+    #
+    # containerd 2.3 使用最新 config version 4。
+    # 不继续沿用旧的 containerd 1.x config。
     # ============================================================
 
     - name: Ensure containerd config directory exists
@@ -300,23 +384,39 @@
         group: root
         mode: "0755"
 
-    - name: Generate default containerd config
+    - name: Generate default containerd 2.3 configuration
       ansible.builtin.command:
         cmd: containerd config default
       register: containerd_default_config
       changed_when: false
 
-    - name: Write containerd configuration
+    - name: Write fresh containerd configuration
       ansible.builtin.copy:
         dest: /etc/containerd/config.toml
         content: "{{ containerd_default_config.stdout }}\n"
         owner: root
         group: root
         mode: "0644"
+        backup: true
 
 
     # ============================================================
-    # 13. Enable SystemdCgroup
+    # 14. Verify config version
+    # ============================================================
+
+    - name: Check containerd config version
+      ansible.builtin.command:
+        cmd: grep -E '^version\s*=\s*4' /etc/containerd/config.toml
+      register: containerd_config_version
+      changed_when: false
+
+    - name: Show containerd config version
+      ansible.builtin.debug:
+        var: containerd_config_version.stdout
+
+
+    # ============================================================
+    # 15. Configure SystemdCgroup
     # ============================================================
 
     - name: Enable SystemdCgroup
@@ -331,9 +431,32 @@
       register: systemd_cgroup_check
       changed_when: false
 
+    - name: Show SystemdCgroup configuration
+      ansible.builtin.debug:
+        var: systemd_cgroup_check.stdout_lines
+
 
     # ============================================================
-    # 14. Configure Tinyproxy for containerd
+    # 16. Verify CNI binary path
+    #
+    # 之前我们踩过 /usr/lib/cni 和 /opt/cni/bin 不一致的问题。
+    # containerd 2.3 默认应该使用 bin_dirs = ['/opt/cni/bin']
+    # ============================================================
+
+    - name: Verify containerd CNI binary path
+      ansible.builtin.shell:
+        cmd: |
+          grep -n "/opt/cni/bin" /etc/containerd/config.toml
+      register: cni_bin_dir_check
+      changed_when: false
+
+    - name: Show containerd CNI binary path
+      ansible.builtin.debug:
+        var: cni_bin_dir_check.stdout_lines
+
+
+    # ============================================================
+    # 17. Configure TinyProxy for containerd daemon
     # ============================================================
 
     - name: Ensure containerd systemd override directory exists
@@ -344,7 +467,7 @@
         group: root
         mode: "0755"
 
-    - name: Configure Tinyproxy for containerd daemon
+    - name: Configure TinyProxy for containerd daemon
       ansible.builtin.copy:
         dest: /etc/systemd/system/containerd.service.d/http-proxy.conf
         owner: root
@@ -361,7 +484,7 @@
 
 
     # ============================================================
-    # 15. Restart containerd
+    # 18. Restart containerd
     # ============================================================
 
     - name: Restart and enable containerd
@@ -373,7 +496,7 @@
 
 
     # ============================================================
-    # 16. Verify service
+    # 19. Verify containerd service
     # ============================================================
 
     - name: Verify containerd service is active
@@ -382,9 +505,15 @@
       register: containerd_status
       changed_when: false
 
+    - name: Verify containerd service is enabled
+      ansible.builtin.command:
+        cmd: systemctl is-enabled containerd
+      register: containerd_enabled
+      changed_when: false
+
 
     # ============================================================
-    # 17. Verify running process proxy
+    # 20. Verify containerd process proxy environment
     # ============================================================
 
     - name: Verify containerd process environment
@@ -395,37 +524,124 @@
           tr '\0' '\n' < "/proc/${pid}/environ" | grep -i '_proxy='
       register: containerd_proxy_env
       changed_when: false
+      no_log: true
+
+    - name: Show proxy environment verification
+      ansible.builtin.debug:
+        msg: "containerd proxy environment loaded successfully"
 
 
     # ============================================================
-    # 18. Verify CRI
+    # 21. Verify containerd CRI plugins
+    #
+    # containerd 2.x:
+    # io.containerd.cri.v1 images
+    # io.containerd.cri.v1 runtime
+    #
+    # 两个都必须是 ok。
     # ============================================================
 
-    - name: Verify containerd CRI plugin
+    - name: Show containerd CRI plugins
       ansible.builtin.shell:
         cmd: |
-          ctr plugins ls | grep -E 'io.containerd.grpc.v1.cri|io.containerd.cri'
+          ctr plugins ls | grep 'io.containerd.cri.v1'
+      register: cri_plugin_list
+      changed_when: false
+
+    - name: Display containerd CRI plugins
+      ansible.builtin.debug:
+        var: cri_plugin_list.stdout_lines
+
+    - name: Verify containerd CRI images and runtime plugins
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+
+          count="$(
+            ctr plugins ls |
+            awk '
+              $1 == "io.containerd.cri.v1" &&
+              ($2 == "images" || $2 == "runtime") &&
+              $NF == "ok" {
+                count++
+              }
+              END {
+                print count + 0
+              }
+            '
+          )"
+
+          echo "$count"
+
+          test "$count" -eq 2
+      args:
+        executable: /bin/bash
       register: cri_plugin_check
+      changed_when: false
+
+
+    # ============================================================
+    # 22. Verify containerd socket
+    # ============================================================
+
+    - name: Verify containerd socket exists
+      ansible.builtin.stat:
+        path: /run/containerd/containerd.sock
+      register: containerd_socket
+
+    - name: Assert containerd socket exists
+      ansible.builtin.assert:
+        that:
+          - containerd_socket.stat.exists
+          - containerd_socket.stat.issock | default(false)
+        fail_msg: |
+          containerd CRI socket not found:
+
+          /run/containerd/containerd.sock
+
+
+    # ============================================================
+    # 23. Check containerd startup log
+    # ============================================================
+
+    - name: Check recent containerd errors
+      ansible.builtin.shell:
+        cmd: |
+          journalctl -u containerd \
+            --since "-2 minutes" \
+            --no-pager \
+            -p warning
+      register: containerd_recent_logs
       changed_when: false
       failed_when: false
 
+    - name: Show recent containerd warnings
+      ansible.builtin.debug:
+        var: containerd_recent_logs.stdout_lines
+      when: containerd_recent_logs.stdout | length > 0
+
 
     # ============================================================
-    # 19. Final output
+    # 24. Final output
     # ============================================================
 
-    - name: Show final upgrade result
+    - name: Show final containerd result
       ansible.builtin.debug:
         msg:
           - "=================================================="
           - "Host: {{ inventory_hostname }}"
           - "OS: {{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] }}"
           - "Codename: {{ ansible_facts['distribution_release'] }}"
+          - "Architecture: {{ docker_repo_arch }}"
           - "Before: {{ old_containerd_version.stdout | default('not installed') }}"
           - "After: {{ new_containerd_version.stdout }}"
-          - "containerd: {{ containerd_status.stdout }}"
+          - "containerd service: {{ containerd_status.stdout }}"
+          - "containerd enabled: {{ containerd_enabled.stdout }}"
+          - "config version: 4"
           - "SystemdCgroup: enabled"
+          - "CNI bin dir: /opt/cni/bin"
           - "Docker CE repo: TUNA"
-          - "Tinyproxy: {{ tinyproxy_ip }}:{{ tinyproxy_port }}"
-          - "CRI: {{ cri_plugin_check.stdout | default('check manually') }}"
+          - "TinyProxy: {{ tinyproxy_ip }}:{{ tinyproxy_port }}"
+          - "CRI images/runtime plugins: OK"
+          - "CRI socket: /run/containerd/containerd.sock"
           - "=================================================="

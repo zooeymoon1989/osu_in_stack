@@ -2,23 +2,92 @@
 - name: Initialize Kubernetes control plane
   hosts: node1
   become: true
+  gather_facts: true
 
   vars:
-    control_plane_ip: "{{ hostvars['node1']['tailscale_ip'] }}"
-    kubernetes_version: "v1.37.0"
-    cri_socket: "unix:///run/containerd/containerd.sock"
+    kubernetes_version: "v1.36.4"
 
-    # 先给 Cilium 预留一个和现有网络不冲突的 Pod CIDR
-    pod_network_cidr: "10.244.0.0/16"
+    containerd_socket: "unix:///run/containerd/containerd.sock"
+
+    service_subnet: "10.96.0.0/12"
+
+    control_plane_ip: "{{ tailscale_ip }}"
+
+    kubeadm_config_file: "/root/kubeadm-init.yaml"
 
   tasks:
+
     # ============================================================
-    # 1. Generate kubeadm configuration
+    # 1. Show configuration
     # ============================================================
 
-    - name: Create kubeadm config
+    - name: Show control plane configuration
+      ansible.builtin.debug:
+        msg:
+          - "=================================================="
+          - "Control Plane: {{ inventory_hostname }}"
+          - "Public IP: {{ ansible_host }}"
+          - "Tailscale IP: {{ control_plane_ip }}"
+          - "Kubernetes: {{ kubernetes_version }}"
+          - "CRI: {{ containerd_socket }}"
+          - "Service CIDR: {{ service_subnet }}"
+          - "=================================================="
+
+
+    # ============================================================
+    # 2. Verify containerd
+    # ============================================================
+
+    - name: Verify containerd is active
+      ansible.builtin.command:
+        cmd: systemctl is-active containerd
+      register: containerd_status
+      changed_when: false
+
+    - name: Verify containerd socket exists
+      ansible.builtin.stat:
+        path: /run/containerd/containerd.sock
+      register: containerd_socket_stat
+
+    - name: Assert containerd is ready
+      ansible.builtin.assert:
+        that:
+          - containerd_status.stdout == "active"
+          - containerd_socket_stat.stat.exists
+        fail_msg: "containerd is not ready"
+
+
+    # ============================================================
+    # 3. Verify Tailscale IP
+    # ============================================================
+
+    - name: Get local Tailscale IPv4
+      ansible.builtin.command:
+        cmd: tailscale ip -4
+      register: actual_tailscale_ip
+      changed_when: false
+
+    - name: Verify inventory Tailscale IP
+      ansible.builtin.assert:
+        that:
+          - actual_tailscale_ip.stdout | trim == control_plane_ip
+        fail_msg: |
+          Tailscale IP mismatch.
+
+          Inventory:
+          {{ control_plane_ip }}
+
+          Actual:
+          {{ actual_tailscale_ip.stdout }}
+
+
+    # ============================================================
+    # 4. Generate kubeadm configuration
+    # ============================================================
+
+    - name: Generate kubeadm init configuration
       ansible.builtin.copy:
-        dest: /root/kubeadm-config.yaml
+        dest: "{{ kubeadm_config_file }}"
         owner: root
         group: root
         mode: "0600"
@@ -31,7 +100,11 @@
             bindPort: 6443
 
           nodeRegistration:
-            criSocket: "{{ cri_socket }}"
+            name: "{{ inventory_hostname }}"
+            criSocket: "{{ containerd_socket }}"
+            kubeletExtraArgs:
+              - name: node-ip
+                value: "{{ control_plane_ip }}"
 
           ---
           apiVersion: kubeadm.k8s.io/v1beta4
@@ -42,38 +115,86 @@
           controlPlaneEndpoint: "{{ control_plane_ip }}:6443"
 
           networking:
-            podSubnet: "{{ pod_network_cidr }}"
+            serviceSubnet: "{{ service_subnet }}"
+            dnsDomain: "cluster.local"
 
           apiServer:
             certSANs:
               - "{{ control_plane_ip }}"
-              - "node1"
-              - "127.0.0.1"
-              - "localhost"
+              - "{{ inventory_hostname }}"
+
 
     # ============================================================
-    # 2. Pull Kubernetes images
+    # 5. Show kubeadm config
+    # ============================================================
+
+    - name: Show kubeadm configuration
+      ansible.builtin.command:
+        cmd: cat {{ kubeadm_config_file }}
+      register: kubeadm_config_output
+      changed_when: false
+
+    - name: Display kubeadm configuration
+      ansible.builtin.debug:
+        var: kubeadm_config_output.stdout_lines
+
+
+    # ============================================================
+    # 6. Validate kubeadm configuration
+    # ============================================================
+
+    - name: Validate kubeadm configuration
+      ansible.builtin.command:
+        cmd: kubeadm config validate --config {{ kubeadm_config_file }}
+      changed_when: false
+
+
+    # ============================================================
+    # 7. Pull Kubernetes control plane images
     # ============================================================
 
     - name: Pull Kubernetes control plane images
       ansible.builtin.command:
-        cmd: kubeadm config images pull --config /root/kubeadm-config.yaml
-      register: kubeadm_images
+        cmd: kubeadm config images pull --config {{ kubeadm_config_file }}
+      register: image_pull_result
       changed_when: true
 
+
     # ============================================================
-    # 3. Initialize control plane
+    # 8. Check whether cluster is already initialized
+    # ============================================================
+
+    - name: Check Kubernetes admin.conf
+      ansible.builtin.stat:
+        path: /etc/kubernetes/admin.conf
+      register: kubernetes_admin_conf
+
+
+    # ============================================================
+    # 9. Initialize Kubernetes control plane
     # ============================================================
 
     - name: Initialize Kubernetes control plane
       ansible.builtin.command:
-        cmd: kubeadm init --config /root/kubeadm-config.yaml
-      args:
-        creates: /etc/kubernetes/admin.conf
-      register: kubeadm_init
+        cmd: kubeadm init --config {{ kubeadm_config_file }}
+      register: kubeadm_init_result
+      when: not kubernetes_admin_conf.stat.exists
+
 
     # ============================================================
-    # 4. Configure kubectl for root
+    # 10. Show kubeadm init output
+    # ============================================================
+
+    - name: Show kubeadm init result
+      ansible.builtin.debug:
+        var: kubeadm_init_result.stdout_lines
+      when:
+        - kubeadm_init_result is defined
+        - kubeadm_init_result.stdout_lines is defined
+
+
+    # ============================================================
+    # 11. Configure kubectl for root
     # ============================================================
 
     - name: Create root kubeconfig directory
@@ -84,7 +205,7 @@
         group: root
         mode: "0700"
 
-    - name: Copy Kubernetes admin config
+    - name: Install admin kubeconfig
       ansible.builtin.copy:
         src: /etc/kubernetes/admin.conf
         dest: /root/.kube/config
@@ -93,8 +214,20 @@
         group: root
         mode: "0600"
 
+
     # ============================================================
-    # 5. Verify control plane
+    # 12. Generate worker join command
+    # ============================================================
+
+    - name: Generate worker join command
+      ansible.builtin.command:
+        cmd: kubeadm token create --print-join-command
+      register: worker_join_command
+      changed_when: false
+
+
+    # ============================================================
+    # 13. Verify API Server
     # ============================================================
 
     - name: Get Kubernetes nodes
@@ -102,9 +235,25 @@
         cmd: kubectl get nodes -o wide
       environment:
         KUBECONFIG: /etc/kubernetes/admin.conf
-      register: kubernetes_nodes
+      register: kubectl_nodes
       changed_when: false
 
-    - name: Show Kubernetes nodes
+
+    # ============================================================
+    # 14. Final result
+    # ============================================================
+
+    - name: Show control plane result
       ansible.builtin.debug:
-        var: kubernetes_nodes.stdout_lines
+        msg:
+          - "=================================================="
+          - "Control Plane: {{ inventory_hostname }}"
+          - "API Server: https://{{ control_plane_ip }}:6443"
+          - "Kubernetes: {{ kubernetes_version }}"
+          - ""
+          - "Worker join command:"
+          - "{{ worker_join_command.stdout }}"
+          - ""
+          - "Current nodes:"
+          - "{{ kubectl_nodes.stdout }}"
+          - "=================================================="
